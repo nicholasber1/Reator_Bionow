@@ -1,0 +1,276 @@
+import cv2
+import pytesseract
+import pandas as pd
+import numpy as np
+import os
+import re
+from collections import Counter
+
+# =====================================================================
+# CONFIGURAÇÕES INICIAIS
+# =====================================================================
+pasta_imagens = "/content/drive/MyDrive/Colab Notebooks/frames"
+
+nomes_gases = ["CO", "CO2", "CH4", "CnHm", "H2", "O2", "C2H2", "C2H4"]
+cabecalhos_colunas = ["L1", "L2", "L3", "L4", "L5", "L6"]
+
+# --- PARÂMETROS DE VALIDAÇÃO ---
+TOLERANCIA_MAXIMA = 50.0 
+TOLERANCIA_HORIZONTAL = 2.0 
+
+dfs_frames = []
+padrao_numero = re.compile(r'\d+\.\d+')
+
+# --- NOVO: Memória Contínua (Guarda apenas o ÚLTIMO valor lido no tempo) ---
+memoria_valores = {gas: None for gas in nomes_gases}
+
+# --- NOVO: Contador global de medidas para o Excel ---
+contador_medida_global = 1
+
+def ordenacao_natural(texto):
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', texto)]
+
+def identificar_gas_na_linha(linha_texto):
+    texto = linha_texto.upper()
+    if any(p in texto for p in ['O2', '02', 'Q2', 'OZ', 'OO']): return 'O2'
+    if any(p in texto for p in ['H2', 'HZ', 'BE']): return 'H2'
+    if any(p in texto for p in ['CH4', 'GUA', 'OLE', 'CNA']): return 'CH4'
+    if any(p in texto for p in ['CO2', 'C02', 'CE', 'GE', 'CC2']): return 'CO2'
+    if any(p in texto for p in ['CNHM', 'COL', 'TE', 'HM']): return 'CnHm'
+    if any(p in texto for p in ['C2H4', 'GA', 'GAH']): return 'C2H4'
+    if any(p in texto for p in ['C2H2', 'GIZ']): return 'C2H2'
+    if any(p in texto for p in ['CO', 'QO', 'GO', '0O', 'Q0']): return 'CO'
+    return None
+
+if not os.path.exists(pasta_imagens):
+    print(f"ERRO: A pasta '{pasta_imagens}' não foi encontrada!")
+else:
+    lista_arquivos = [f for f in os.listdir(pasta_imagens) if f.endswith('.jpg')]
+    lista_arquivos.sort(key=ordenacao_natural)
+    print(f"Iniciando Processamento Sequencial Contínuo em {len(lista_arquivos)} imagens...\n")
+
+    def rodar_ocr(niveis, imagem_para_ler):
+        tabelas_validas_do_frame = []
+        for sensibilidade in niveis:
+            imagem_binarizada = cv2.adaptiveThreshold(
+                imagem_para_ler, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 51, sensibilidade
+            )
+
+            texto_extraido = pytesseract.image_to_string(imagem_binarizada, config='--psm 6')
+
+            texto = texto_extraido.replace(',', '.').replace("'", ".").replace(':', '.').replace('°', '')
+            texto = texto.replace('. ', '.') 
+            texto = texto.replace('O', '0').replace('o', '0').replace('L', '1').replace('l', '1')
+            texto = texto.replace('S', '5').replace('s', '5').replace('z', '2').replace('Z', '2')
+            texto = re.sub(r'000+\.00\.00', '0.00 0.00 0.00', texto)
+
+            linhas = texto.split('\n')
+            tabela_da_passagem = {gas: [np.nan]*6 for gas in nomes_gases}
+            linhas_numericas = []
+            
+            for linha in linhas:
+                numeros = padrao_numero.findall(linha)
+                if len(numeros) >= 4:
+                    while len(numeros) < 6: numeros.append(numeros[-1])
+                    linhas_numericas.append((linha, numeros[:6]))
+
+            if len(linhas_numericas) == 8:
+                for i, gas in enumerate(nomes_gases):
+                    tabela_da_passagem[gas] = [float(n) for n in linhas_numericas[i][1]]
+            else:
+                for texto_linha, numeros in linhas_numericas:
+                    gas_encontrado = identificar_gas_na_linha(texto_linha)
+                    if gas_encontrado:
+                        tabela_da_passagem[gas_encontrado] = [float(n) for n in numeros]
+
+            tabelas_validas_do_frame.append(tabela_da_passagem)
+
+        consenso = {gas: [np.nan]*6 for gas in nomes_gases}
+        for gas in nomes_gases:
+            for j in range(6):
+                votos = [tab[gas][j] for tab in tabelas_validas_do_frame if not np.isnan(tab[gas][j])]
+                if votos:
+                    vencedor = Counter(votos).most_common(1)[0][0]
+                    consenso[gas][j] = float(vencedor)
+        return consenso
+
+
+    def aplicar_cirurgia_no_excel(tabela_raw):
+        tabela_excel = {gas: list(tabela_raw[gas]) for gas in nomes_gases}
+        recuperacoes_anotadas = {j: [] for j in range(6)}
+        
+        for gas in nomes_gases:
+            valores_validos = [v for v in tabela_excel[gas] if not np.isnan(v)]
+            if len(valores_validos) >= 3:
+                consenso_linha = Counter(np.round(valores_validos, 1)).most_common(1)[0][0]
+                str_cons = f"{consenso_linha:.2f}"
+                
+                for j in range(6):
+                    valor = tabela_excel[gas][j]
+                    if not np.isnan(valor) and abs(valor - consenso_linha) > TOLERANCIA_HORIZONTAL:
+                        str_val = f"{valor:.2f}"
+                        salvo = False
+                        novo_valor = None
+                        
+                        if len(str_val) == len(str_cons):
+                            for i in range(len(str_val)):
+                                if str_val[i] != '.' and str_val[i] != str_cons[i]:
+                                    tentativa_str = str_val[:i] + str_cons[i] + str_val[i+1:]
+                                    try:
+                                        tentativa_num = float(tentativa_str)
+                                        if abs(tentativa_num - consenso_linha) <= TOLERANCIA_HORIZONTAL:
+                                            novo_valor = tentativa_num
+                                            salvo = True
+                                            break
+                                    except ValueError:
+                                        pass
+                                        
+                        if not salvo:
+                            for corte in range(1, len(str_val) - 3):
+                                tentativa_num = float(str_val[corte:])
+                                if abs(tentativa_num - consenso_linha) <= TOLERANCIA_HORIZONTAL:
+                                    novo_valor = tentativa_num
+                                    salvo = True
+                                    break
+                                    
+                        if salvo:
+                            tabela_excel[gas][j] = novo_valor
+                            recuperacoes_anotadas[j].append(f"{gas} ({valor:.2f} -> {novo_valor:.2f})")
+                        else:
+                            tabela_excel[gas][j] = np.nan
+                            
+        return tabela_excel, recuperacoes_anotadas
+
+
+    # =====================================================================
+    # O LOOP PRINCIPAL DE IMAGENS
+    # =====================================================================
+    for arquivo in lista_arquivos:
+        caminho_imagem = os.path.join(pasta_imagens, arquivo)
+        
+        imagem = cv2.imread(caminho_imagem)
+        imagem = cv2.rotate(imagem, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        imagem_cortada = imagem[18:426, 147:665]
+
+        if imagem_cortada is None or imagem_cortada.size == 0:
+            print(f"⚠️ {arquivo}: Imagem vazia.")
+            continue
+        
+        imagem_ampliada = cv2.resize(imagem_cortada, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        imagem_cinza = cv2.cvtColor(imagem_ampliada, cv2.COLOR_BGR2GRAY)
+        imagem_desfocada = cv2.GaussianBlur(imagem_cinza, (7, 7), 0)
+
+        tabela_bruta = rodar_ocr([6, 10, 14], imagem_desfocada)
+        tabela_excel, recuperacoes = aplicar_cirurgia_no_excel(tabela_bruta)
+
+        # --- NOVO: Verifica com a Memória Sequencial Contínua ---
+        precisa_refinar = False
+        for gas in nomes_gases:
+            ultimo_val = memoria_valores[gas] # Carrega o último valor real (ex: da foto anterior)
+            for j in range(6):
+                valor_atual = tabela_excel[gas][j]
+                if np.isnan(valor_atual):
+                    precisa_refinar = True 
+                    break
+                elif ultimo_val is not None:
+                    if abs(valor_atual - ultimo_val) > TOLERANCIA_MAXIMA:
+                        precisa_refinar = True 
+                        break
+                    else:
+                        ultimo_val = valor_atual # Atualiza para validar o próximo L(x) na mesma foto
+                else:
+                    ultimo_val = valor_atual
+            if precisa_refinar: break
+
+        if precisa_refinar:
+            print(f"⚠️ {arquivo}: Dúvidas na leitura contínua. Acionando Malha Fina (9 níveis)...")
+            tabela_bruta = rodar_ocr([-2, 2, 5, 8, 11, 14, 17, 21, 25], imagem_desfocada)
+            tabela_excel, recuperacoes = aplicar_cirurgia_no_excel(tabela_bruta)
+            status_passagem = "Malha Fina"
+        else:
+            status_passagem = "Rápida"
+
+
+        # =====================================================================
+        # O FILTRO FINAL DE TEMPO SEQUENCIAL
+        # =====================================================================
+        gases_ignorados_no_frame = {j: [] for j in range(6)}
+
+        for gas in nomes_gases:
+            for j in range(6):
+                valor_atual = tabela_excel[gas][j]
+
+                if not np.isnan(valor_atual):
+                    valor_anterior = memoria_valores[gas]
+                    
+                    if valor_anterior is not None:
+                        if abs(valor_atual - valor_anterior) > TOLERANCIA_MAXIMA:
+                            tabela_excel[gas][j] = np.nan 
+                            tabela_bruta[gas][j] = np.nan 
+                            gases_ignorados_no_frame[j].append(f"{gas} (Dif Tempo > {TOLERANCIA_MAXIMA})")
+                        else:
+                            memoria_valores[gas] = valor_atual # Salva permanentemente para o próximo ciclo
+                    else:
+                        memoria_valores[gas] = valor_atual 
+                else:
+                    tabela_bruta[gas][j] = np.nan 
+                    gases_ignorados_no_frame[j].append(f"{gas} (Ilegível)")
+
+        # =====================================================================
+        # MONTAGEM DA TABELA EXCEL
+        # =====================================================================
+        linhas_df = []
+        for j in range(6):
+            linha_dict = {
+                'Medida_Acumulada': contador_medida_global, # Eixo X contínuo
+                'Arquivo_Origem': arquivo,
+                'Leitura_no_Frame': cabecalhos_colunas[j]
+            }
+            contador_medida_global += 1 # Conta +1 para a próxima linha
+            
+            for gas in nomes_gases:
+                linha_dict[gas] = tabela_excel[gas][j]
+
+            falhas = gases_ignorados_no_frame[j]
+            salvos = recuperacoes[j]
+            obs_lista = []
+            
+            if falhas: obs_lista.append("Faltou: " + ", ".join(falhas))
+            if salvos: obs_lista.append("Recuperado: " + ", ".join(salvos))
+                
+            if not obs_lista:
+                linha_dict['Observacoes_da_Falha'] = f"100% OK (Passagem {status_passagem})"
+            else:
+                linha_dict['Observacoes_da_Falha'] = " | ".join(obs_lista)
+
+            linhas_df.append(linha_dict)
+
+        dfs_frames.append(pd.DataFrame(linhas_df))
+        
+        # --- PRINT NO TERMINAL ---
+        print(f"✅ Processado: {arquivo} | Via Passagem {status_passagem}")
+        print("   --- Leituras (RAW/Brutas) ---")
+        for gas in nomes_gases:
+            valores_formatados = [f"{v:6.2f}" if not np.isnan(v) else "  N/A " for v in tabela_bruta[gas]]
+            print(f"   {gas:<5}: [{', '.join(valores_formatados)}]")
+        print("-" * 60) 
+
+    # =====================================================================
+    # SALVAMENTO DO EXCEL FINAL
+    # =====================================================================
+    if dfs_frames:
+        df_final = pd.concat(dfs_frames, ignore_index=True)
+        
+        df_final.fillna("N/A", inplace=True)
+
+        caminho_arquivo_excel = os.path.join(pasta_imagens, "relatorio_gases_adaptativo.xlsx")
+        df_final.to_excel(caminho_arquivo_excel, index=False)
+
+        print("\n=======================================================")
+        print(f"🚀 FINALIZADO! Processamento Adaptativo concluído com sucesso.")
+        print(f"O Excel foi salvo em: '{caminho_arquivo_excel}'")
+        print("=======================================================")
+    else:
+        print("\n❌ ERRO FATAL: Nenhuma tabela válida pôde ser extraída.")
