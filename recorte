@@ -1,0 +1,28 @@
+import cv2
+
+# 1. Coloque o caminho da sua imagem de teste
+caminho_imagem = r"C:\temp\ws-pycharm\primeiro\pythonProject1\Difusao\frame_50.jpg"
+imagem = cv2.imread(caminho_imagem)
+
+# ⚠️ AVISO SOBRE ROTAÇÃO:
+# Na imagem que você enviou (frame_24.jpg), o texto já está na horizontal.
+# Se a foto original do seu celular/câmera estiver de lado, descomente a linha abaixo.
+# Se ela já abre normal no seu Windows, DEIXE COMENTADO!
+# imagem = cv2.rotate(imagem, cv2.ROTATE_90_CLOCKWISE)
+
+# 2. Abre a ferramenta interativa
+print("Janela aberta! Desenhe um retângulo apenas ao redor da tabela.")
+print("Depois de desenhar, aperte ENTER ou ESPAÇO.")
+roi = cv2.selectROI("Selecione a Tabela (Aperte ENTER para confirmar)", imagem, showCrosshair=False)
+
+# 3. Fecha a janela
+cv2.destroyAllWindows()
+
+# 4. Extrai as coordenadas: (x, y, largura, altura)
+x, y, w, h = roi
+
+print("\n" + "="*50)
+print("🎯 COORDENADAS DESCOBERTAS COM SUCESSO!")
+print("Substitua toda a parte de corte do seu código principal por isso aqui:\n")
+print(f"imagem_cortada = imagem[{y}:{y+h}, {x}:{x+w}]")
+print("="*50 + "\n")
